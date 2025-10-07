@@ -132,12 +132,12 @@ namespace mcp {
             }
 
             // Get the last activity time
-            void update_activity() {
+            std::chrono::steady_clock::time_point last_activity() const {
                 std::lock_guard<std::mutex> lk(m_);
-                last_activity_ = std::chrono::steady_clock::now();
+                return last_activity_;
             }
 
-            // Update the activity time
+            // Update the activity time (when sending or receiving a message)
             void update_activity() {
                 std::lock_guard<std::mutex> lk(m_);
                 last_activity_ = std::chrono::steady_clock::now();
