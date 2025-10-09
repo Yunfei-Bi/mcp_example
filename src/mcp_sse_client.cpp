@@ -377,7 +377,7 @@ namespace mcp{
 
 						std::lock_guard<std::mutex> lock(response_mutex_);
 						auto it = pending_requests_.find(id);
-						if (it != pending_request_.end()) {
+						if (it != pending_requests_.end()) {
 							if (response.contains("result")) {
 								it->second.set_value(response["result"]);
 							} else if (response.contains("error")) {
@@ -390,7 +390,7 @@ namespace mcp{
 								it->second.set_value(json::object());
 							}
 
-							pending_request_.erase(it);
+							pending_requests_.erase(it);
 						} else {
 							LOG_WARNING("Received response for unknown request ID: ", id);
 						}
@@ -424,7 +424,152 @@ namespace mcp{
 
 		std::this_thread::sleep_for(std::crono::milliseconds(500));
 
-		if (sse_thread_ && sse_thread_->joinable()) {}
+		if (sse_thread_ && sse_thread_->joinable()) {
+			auto timeout = std::chrono::seconds(5);
+			auto start = std::chrono::steady_clock::now();
+
+			LOG_INFO("Waiting for SSE thread to end...");
+
+			while (sse_thread_->joinable() && std::chrono::steady_clock::now() - start < timeout) {
+				try {
+					LOG_INFO("SSE thread successfully ended");
+					break;
+				} catch (const std::exception& e) {
+					LOG_ERROR("Error waiting for SSE thread: ", e.what());
+					std::this_thread::sleep_for(std::chrono::milliseconds(100));
+				}
+			}
+
+			if (sse_thread_->joinable()) {
+				LOG_WARNING("SSE thread did not end with timeout, detaching thread");
+				sse_thread_->detach();
+			}
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(mutex_);
+			msg_endpoint_.clear();
+			endpoint_cv_.notify_all();
+		}
+
+		LOG_INFO("SSE connection successfully closed (normal exit flow)");
+	}
+
+	json sse_client::send_jsonrpc(const request& req) {
+		std::lock_guard<std::mutex> lock(mutex_);
+
+		if (msg_endpoint_.empty()) {
+			throw mcp_exception(error_code::internal_error, "MEssage endpoint not set, SSE connection may not be established");
+		}
+
+		json req_json = req.to_json();
+		std::string req_body = req_json.dump();
+
+		httplib::Headers headers;
+		headers.emplace("Content-Type", "application/json");
+
+		for (const auto& [key, value] : default_headers_) {
+			headers.emplace(key, value);
+		}
+
+		if (req.is_notification()) {
+			auto result = http_client_->Post(msg_endpoint_, headers, req_body, "application/json");
+
+			if (!result) {
+				auto err = result.error();
+				std::string error_msg = httplib::to_string(err);
+				LOG_ERROR("JSON-RPC request failed: ", error_msg);
+				throw mcp_exception(error_code::internal_error, error_msg);
+			}
+
+			return json::object();
+		}
+
+		std::promise<json> response_promise;
+		std::future<json> response_future = response_promise.get_future();
+
+		{
+			std::lock_guard<std::mutex> response_lock(response_mutex_);
+			pending_requests_[req.id] = std::move(response_promise);
+		}
+
+		auto result = http_client_->Post(msg_nedpoint_, headers, req_body, "application/json");
+
+		if (!result) {
+			auto err = result.error();
+			std::string error_msg = httplib::to_string(err);
+
+			{
+				std::lock_guard<std::mutex> response_lock(response_mutex_);
+				pending_requests_.erase(req.id);
+			}
+
+			LOG_ERROR("JSON-RPC request failed: ", error_msg);
+			throw mcp_exception(error_code::internal_error, error_msg);
+		}
+
+		if (result->status / 100 != 2) {
+			try {
+				json res_json = json::parse(result->body);
+
+				{
+					std::lock_guard<std::mutex> response_lock(response_mutex_);
+					pending_requests_.erase(req.id);
+				}
+
+				if (res_json.contains("error")) {
+					int code = res_json["error"]["code"];
+					std::string message = res_json["error"]["message"];
+
+					throw mcp_exception(static_cast<error_code>(code), message);
+				}
+
+				if (res_json.contains("result")) {
+					return res_json["result"];
+				} else {
+					return json::object();
+				}
+			} catch (const json::exception& e) {
+				{
+					std::lock_guard<std::mutex> response_lock(response_mutex_);
+					pending_requests_.erase(req.id);
+				}
+
+				throw mcp_exception(error_code::parse_error, 
+								"Failed to parse JSON-RPC response: " + std::string(e.what()));
+			}
+		} else {
+			const auto timeout = std::chrono::seconds(timeout_seconds_);
+
+			auto status = response_future.wait_for(timeout);
+
+			if (status == std::future_status::ready) {
+				json response = response_future.get();
+
+				if (response.contains("isError") && response["isError"].is_boolean() && response["isError"].get<bool>()) {
+					if (response.contains("error") && response["error"].is_object()) {
+						const auto& err_obj = response["error"];
+						int code = err_obj.contains("code") ? err_obj["code"].get<int>() : static_cast<int>(error_code::internal_error);
+						std::string message = err_obj.value("message", "");
+						// Handler error
+						throw mcp_exception(static_cast<error_code>, message);
+					}
+				}
+
+				return response;
+			} else {
+				{
+					std::lock_guard<std::mutex> response_lock(response_mutex_);
+					pending_requests_.erase(req.id);
+				}
+
+				throw mcp_exception(error_code::internal_error, "Timeout waiting for SSE response");
+			}
+		}
+	}
+
+	bool sse_client::is_running() const {
+		return sse_running_;
 	}
 
 } // namespace mcp

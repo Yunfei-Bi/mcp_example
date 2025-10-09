@@ -863,7 +863,7 @@ namespace mcp {
                 thread_to_release.release();
             }
         } catch (const std::exception& e) {
-            LOG_WARNING("Exception whlie cleaning up session resources: ", session_id, ", ", e.what());
+            LOG_WARNING("Exception while cleaning up session resources: ", session_id, ", ", e.what());
         } catch (...) {
             LOG_WARNING("Unknown exception while cleaning up session resources: ", session_id);
         }
